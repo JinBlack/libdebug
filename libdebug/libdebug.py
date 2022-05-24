@@ -1,3 +1,4 @@
+from ast import arg
 from ctypes import CDLL, create_string_buffer, POINTER, c_void_p, c_int, c_long, c_char_p, get_errno, set_errno
 from .ptrace import *
 import struct
@@ -9,9 +10,15 @@ import signal
 import time
 import logging
 import re
-from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+from capstone import Cs, CS_ARCH_X86, CS_MODE_64, debug
 
 logging = logging.getLogger("libdebug")
+## Utils
+def u64(value):
+    return struct.unpack("<Q", value)[0]
+
+def u32(value):
+    return struct.unpack("<I", value)[0]
 
 class DebugFail(Exception):
     pass
@@ -145,7 +152,6 @@ class ThreadDebug():
 
         for name, value in zip(self.regs_names, regs):
             self.regs[name] = value
-        logging.debug("TID[%d] %#x", self.tid, self.regs['rax'])
         return self.regs
 
     def _get_fpreg(self, name):
@@ -266,32 +272,34 @@ class ThreadDebug():
 
         return True
 
-    @staticmethod
-    def _u64(value):
-        return struct.unpack("<Q", value)[0]
-
-    @staticmethod
-    def _u32(value):
-        return struct.unpack("<I", value)[0]
-
 
     def _sig_stop(self):
         os.kill(self.tid, signal.SIGSTOP)
-
+        self.running = False
 
     def _wait_process(self):
         pid = self.tid
+        logging.debug("[TID %d] waiting", pid)
+        if not self.running:
+            logging.debug("[TID %d] not running. No need to wait", pid)
+            return
         options = 0x40000000
         for i in range(8):
             self.buf[i] = b"\x00"
         r = self.libc.waitpid(pid, self.buf, options)
-        status = self._u32(self.buf[:4])
+        status = u32(self.buf[:4])
         logging.debug("[TID %d] waitpid status: %#x, ret: %d", self.tid, status, r)
         self.running = False
 
+    def _interrupt(self):
+        self.libc.ptrace.argtypes = self.args_int
+        if (self.libc.ptrace(PTRACE_INTERRUPT, self.tid, NULL, NULL) == -1):
+            logging.debug("[TID %d] already stopped?", self.tid)
+
     def _stop_process(self):
         logging.debug("[TID %d] Stopping the process", self.tid)
-        self._sig_stop(self.tid)
+        # self._interrupt()
+        self._sig_stop()
         self._wait_process()
         self.running = False
 
@@ -306,6 +314,7 @@ class ThreadDebug():
         """
         Execute the next instruction (Step Into)
         """
+        logging.debug("[TID %d] Stepping %#x", self.tid, self.rip)
         #Step can stuck running into syscalls
         self.running = True
         self.libc.ptrace.argtypes = self.args_int
@@ -320,10 +329,10 @@ class ThreadDebug():
         #I need to execute at least another instruction otherwise I get always in the same bp
         self.libc.ptrace.argtypes = self.args_int
         self.running = True
+        logging.debug("[TID %d] continuing.", self.tid)
         # Probably should implement a timeout
         if (self.libc.ptrace(PTRACE_CONT, self.tid, NULL, NULL) == -1):
             raise DebugFail("[%d] Continue Failed. Do you have permisions? Running as sudo?" % self.tid)
-
 
 class Debugger:
 
@@ -352,6 +361,7 @@ class Debugger:
         #create property for registers
         for r in AMD64_REGS+FPREGS_SHORT+FPREGS_INT+FPREGS_80+FPREGS_128:
             setattr(Debugger, r, self._get_reg(r))
+            setattr(Debugger, "%ss" % r, self._get_regs(r))
 
         if pid is not None:
             self.attach(pid)
@@ -360,23 +370,29 @@ class Debugger:
     def _get_reg(self, name):
         #This is an helping function to generate properties to access registers        
         def getter(self):
-            #reload registers
             r = self.threads[self.cur_tid].get_regs()
             return r[name]
         def setter(self, value):
+            #reload registers
             self.threads[self.cur_tid].get_regs()
             self.threads[self.cur_tid].regs[name] = value
             self.threads[self.cur_tid].set_regs()
         return property(getter, setter, None, name)
 
-    ## Utils
-    @staticmethod
-    def _u64(value):
-        return struct.unpack("<Q", value)[0]
 
-    @staticmethod
-    def _u32(value):
-        return struct.unpack("<I", value)[0]
+    def _get_regs(self, name):
+        #This is an helping function to generate properties to access registers        
+        def getter(self):
+            #reload registers
+            r = list(map(lambda x: self.threads[x].get_regs()[name], self.threads))
+            return r
+        def setter(self, value):
+            for x, v in zip(self.threads, value):
+                self.threads[x].get_regs()
+                self.threads[x].regs[name] = v
+                self.threads[x].set_regs()
+        return property(getter, setter, None, name)
+
 
     def _sig_stop(self, pid):
         os.kill(pid, signal.SIGSTOP)
@@ -390,24 +406,21 @@ class Debugger:
             if t not in self.threads:
                 logging.debug("New Thread %d", t)
                 self.threads[t] = ThreadDebug(t)
+                self.threads[t]._sig_stop()
                 # self._sig_stop(t)
                 # self.attach(t)
 
     def _wait_process(self, pid=None):
         pid = self.pid if pid is None else pid
-        options = 0x40000000
-        for i in range(8):
-            self.buf[i] = b"\x00"
-        r = self.libc.waitpid(pid, self.buf, options)
-        status = self._u32(self.buf[:4])
-        logging.debug("waitpid status: %#x, ret: %d", status, r)
+        for tid, t in self.threads.items():
+            t._wait_process()
         self._retrieve_maps()
         self._find_new_tids()
         self.running = False
 
     def _stop_process(self):
         logging.debug("Stopping the process")
-        self._sig_stop(self.pid)
+        # self._sig_stop(self.pid)
         self._wait_process()
         self.running = False
 
@@ -418,15 +431,34 @@ class Debugger:
 
 
     def _is_next_instr_call(self):
-        rip = self.rip
-        #fetch 6 bytes. 5 should be enough
-        code = self.mem[rip: rip+6]
-        #maybe we should check if it is 32 or 64 mode
-        md = Cs(CS_ARCH_X86, CS_MODE_64)
-        (address, size, mnemonic, op_str) = next(md.disasm_lite(code, 0x1000))
-        if mnemonic == "call":
-            return True
+        for tid, t in self.threads.items():
+            rip = t.rip
+            #fetch 6 bytes. 5 should be enough
+            code = self.mem[rip: rip+6]
+            #maybe we should check if it is 32 or 64 mode
+            md = Cs(CS_ARCH_X86, CS_MODE_64)
+            (address, size, mnemonic, op_str) = next(md.disasm_lite(code, 0x1000))
+            if mnemonic == "call":
+                return True
         return False
+
+    def _threads_next_instr_call(self):
+        threads = []
+        for tid, t in self.threads.items():
+            rip = t.rip
+            #fetch 6 bytes. 5 should be enough
+            code = self.mem[rip: rip+6]
+            #ref https://www.felixcloutier.com/x86/call
+            CALL_OP_CODES = [ b'\xe8', b'\xff', b'\x9a']
+            #maybe we should check if it is 32 or 64 mode
+            # md = Cs(CS_ARCH_X86, CS_MODE_64)
+            # logging.debug("disams bytes:%r", code)
+            # (address, size, mnemonic, op_str) = next(md.disasm_lite(code, 0x1000))
+            # if mnemonic == "call":
+            #     threads.append(tid)
+            if code[0] in CALL_OP_CODES:
+                threads.append(tid)
+        return threads
 
     def _option_setup(self):
         #PTRACE_O_TRACEFORK, PTRACE_O_TRACEVFORK, PTRACE_O_TRACECLONE and PTRACE_O_TRACEEXIT
@@ -439,14 +471,17 @@ class Debugger:
     def run(self, path, args=[], sleep=None):
         # Gdb does tons of configuration when setting up a new process start
         # For now this is a simple as I can write it
+        logging.debug("about to fork")
         pid = os.fork()
         if pid == 0:
             #child process
             # PTRACE ME
+            logging.debug("PTRACEME")
             self.libc.ptrace.argtypes = self.args_int
             r = self.libc.ptrace(PTRACE_TRACEME, NULL, NULL, NULL)
             # logging.debug("attached %d", r)
             args = [path,] + args
+            logging.debug("execve %s %r", path, args)
             os.execv(path, args)
             raise DebugFail("Exec of new process failed")
         self.pid = pid
@@ -460,7 +495,7 @@ class Debugger:
         if sleep is not None:
             self.cont(blocking=False)
             time.sleep(sleep)
-            self._sig_stop(self.pid)
+            self._enforce_stop()
 
     def attach(self, pid):
         """
@@ -550,10 +585,7 @@ class Debugger:
             os.execv(bin, args)
 
 
-
-
     ## Memory
-
     def peek(self, addr):
         self._check_mem_address(addr)
         self._enforce_stop()
@@ -589,13 +621,13 @@ class Debugger:
 
     def _base_guess(self):
         self.bases["main"] = min([m for m in self.map if self.map[m]['file'] is not None])
-        logging.debug("new base main guessed at %#x", self.bases["main"])
+        # logging.debug("new base main guessed at %#x", self.bases["main"])
 
         for m in self.map:
             if self.map[m]['offset'] == 0 and self.map[m]['file'] is not None:
                 name = self.map[m]['file']
                 self.bases[name] = m
-                logging.debug("new base %s guessed at %#x", name, m)
+                # logging.debug("new base %s guessed at %#x", name, m)
 
     def _retrieve_maps(self):
         # map file example
@@ -667,28 +699,37 @@ class Debugger:
             self.mem[b] = self.breakpoints[b]
             self.breakpoints[b] = None
 
-    def step(self):
+    def step(self, blocking=True):
         """
         Execute the next instruction (Step Into)
         """
         self._enforce_stop()
         for tid, t in self.threads.items():
             t.step()
-        self._wait_process()
+        if blocking:
+            self._wait_process()
 
     def next(self):
         self._enforce_stop()
-        if not self._is_next_instr_call():
+        next_calls = self._threads_next_instr_call()
+        if len(next_calls) == 0:
             return self.step()
         self.step()
-        #if 32 bits this do not works
-        saved_rip = self._u64(self.mem[self.rsp:self.rsp+self.reg_size])
-        logging.debug("next on a call instruction, executing until %#x", saved_rip)
+        #if 32 bits this does not works
+        saved_rips = []
+        for tid in next_calls:
+            t = self.threads[tid]
+            saved_rips.append(u64(self.mem[t.rsp:t.rsp+t.reg_size]))
+    
         #should we have a separate set of breakpoints?
-        bp = self.breakpoint(saved_rip)
+        bps = []
+        for saved_rip in saved_rips:
+            logging.debug("next on a call instruction, executing until %#x", saved_rip)
+            bps.append(self.breakpoint(saved_rip))
         self.cont()
         #this will couse the remove of an old break point placed in that part
-        self.del_bp(bp)
+        for bp in bps:
+            self.del_bp(bp)
         # input("next real done")
 
     def step_until(self, rip):
@@ -708,7 +749,7 @@ class Debugger:
         """
 
         #I need to execute at least another instruction otherwise I get always in the same bp
-        self.step()
+        self.step(blocking)
         self._set_breakpoints()
         self.running = True
         # Probably should implement a timeout
@@ -728,7 +769,7 @@ class Debugger:
         if not self._check_mem_address(self.rbp):
             logging.error("rbp %#x is not a valid frame. Impossible to execute finish", self.rbp)
             raise DebugFail("Finish Failed. Frame not found")
-        ret_addr = Debugger._u64(self.mem[self.rbp+0x8: self.rbp+0x10])
+        ret_addr = u64(self.mem[self.rbp+0x8: self.rbp+0x10])
         logging.info("finish executing until Return Address found at %#x", ret_addr)
         self.bp(ret_addr)
         self.cont(blocking)

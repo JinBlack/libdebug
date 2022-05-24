@@ -14,9 +14,9 @@ int main(int argc, char ** argv){
         if (i1 == 0){
             i2++;
         }
-        if(i0 == 0 && i1 == 0 && i2 == 0){
+        if(i0 == 0 && i1 >= 0x2){
             break;
         }
+        printf("%lu %lu %ld", i0, i1, i2);
     }
-    printf("%lu %lu %ld", i0, i1, i2);
 }
